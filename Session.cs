@@ -7,7 +7,9 @@ using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using Mono.Debugger.Soft;
 
 namespace MonoDbg
@@ -20,12 +22,38 @@ namespace MonoDbg
     {
         static VirtualMachine vm;
         static readonly object gate = new object();
+        const int VmTimeoutMs = 3000;
+
+        // Every VM round-trip goes over a socket to the agent in the game; if the agent stalls
+        // (wedged, scene transition, whatever) an unbounded call blocks whichever thread holds `gate`
+        // forever, which then hangs every other command too. Bound each one; on timeout the client
+        // gets a clear error instead of the daemon going silently unresponsive.
+        static bool TryVm<T>(Func<T> f, out T result, out string error, int timeoutMs = VmTimeoutMs)
+        {
+            result = default;
+            var t = Task.Run(f);
+            if (!t.Wait(timeoutMs)) { error = $"agent unresponsive (timed out after {timeoutMs}ms)"; return false; }
+            if (t.IsFaulted) { error = t.Exception!.GetBaseException().Message; return false; }
+            result = t.Result;
+            error = null;
+            return true;
+        }
+
+        static bool TryVm(Action f, out string error, int timeoutMs = VmTimeoutMs)
+        {
+            var t = Task.Run(f);
+            if (!t.Wait(timeoutMs)) { error = $"agent unresponsive (timed out after {timeoutMs}ms)"; return false; }
+            if (t.IsFaulted) { error = t.Exception!.GetBaseException().Message; return false; }
+            error = null;
+            return true;
+        }
         enum State { Running, Stopped, Dead }
         static State state = State.Running;
         static StackFrame[] frames;
         static string agentError;
         static string sockPath;
         static readonly List<string> armed = new();
+        static PosixSignalRegistration sigterm, sigint;
 
         public static int Run(string host, int port, string sock)
         {
@@ -36,14 +64,43 @@ namespace MonoDbg
             server.Listen(16);
             AppDomain.CurrentDomain.ProcessExit += (_, __) => { try { File.Delete(sock); } catch { } };
 
-            try { vm = VirtualMachineManager.Connect(new IPEndPoint(IPAddress.Parse(host), port)); }
-            catch (Exception e) { agentError = e.Message; }
+            // SIGKILL can't be caught by any code -- if you `kill -9` the daemon, an armed breakpoint
+            // stays live on the agent with no one left to resume it, freezing the game solid the next
+            // time that method runs. SIGTERM/SIGINT (plain `kill`, Ctrl+C) CAN be caught, so detach
+            // properly here to release any armed breakpoints before the process actually exits.
+            void GracefulShutdown(PosixSignalContext ctx)
+            {
+                ctx.Cancel = true;
+                if (vm != null) TryVm(() => vm.Detach(), out _, 2000);
+                Shutdown(0);
+            }
+            sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, GracefulShutdown);
+            sigint = PosixSignalRegistration.Create(PosixSignal.SIGINT, GracefulShutdown);
+
+            // Bounded connect: a wedged agent (e.g. left over from a prior ungraceful client
+            // disconnect) never completes the handshake, and an unbounded Connect() would hang here
+            // forever -- before the listening socket is ever accepted from, with zero diagnostics for
+            // any client. BeginConnect's task also performs the handshake read, so cancelling it on
+            // timeout (closing the socket) unblocks that read too.
+            var ep = new IPEndPoint(IPAddress.Parse(host), port);
+            var ar = VirtualMachineManager.BeginConnect(ep, null);
+            if (!((Task)ar).Wait(TimeSpan.FromSeconds(5)))
+            {
+                VirtualMachineManager.CancelConnection(ar);
+                agentError = $"agent at {host}:{port} did not complete the handshake within 5s " +
+                             "(it may be wedged from a prior ungraceful disconnect -- try restarting the game)";
+            }
+            else
+            {
+                try { vm = VirtualMachineManager.EndConnect(ar); }
+                catch (Exception e) { agentError = e.Message; }
+            }
+
+            if (agentError == null && !TryVm(() => vm.EnableEvents(EventType.VMDeath, EventType.VMDisconnect), out var enErr))
+                agentError = "EnableEvents: " + enErr;
 
             if (agentError == null)
-            {
-                vm.EnableEvents(EventType.VMDeath, EventType.VMDisconnect);
                 new Thread(EventLoop) { IsBackground = true }.Start();
-            }
 
             while (true)
             {
@@ -73,7 +130,7 @@ namespace MonoDbg
                         else if (e is VMDeathEvent || e is VMDisconnectEvent) state = State.Dead;
                     }
                     Monitor.PulseAll(gate);
-                    if (state == State.Running) { try { vm.Resume(); } catch { } }
+                    if (state == State.Running) TryVm(() => vm.Resume(), out _);
                 }
             }
         }
@@ -102,7 +159,7 @@ namespace MonoDbg
                     case "stack": lock (gate) Reply(c, state == State.Stopped, state == State.Stopped ? 0 : 2, state == State.Stopped ? FormatStack() : "[monodbg] not stopped (" + state + ")"); break;
                     case "continue": DoContinue(c); break;
                     case "status": DoStatus(c); break;
-                    case "quit": Reply(c, true, 0, "[monodbg] detaching."); try { vm?.Detach(); } catch { } Shutdown(0); break;
+                    case "quit": Reply(c, true, 0, "[monodbg] detaching."); if (vm != null) TryVm(() => vm.Detach(), out _); Shutdown(0); break;
                     default: Reply(c, false, 64, "unknown cmd '" + cmd + "'"); break;
                 }
             }
@@ -120,7 +177,12 @@ namespace MonoDbg
 
             string msg; ArmResult r;
             lock (gate) r = Arm(tn, mn, asm, out msg);
-            if (r != ArmResult.Armed) { Reply(c, false, r == ArmResult.MethodMissing ? 65 : 66, msg); return; }
+            if (r != ArmResult.Armed)
+            {
+                int code = r switch { ArmResult.MethodMissing => 65, ArmResult.AgentUnresponsive => 67, _ => 66 };
+                Reply(c, false, code, msg);
+                return;
+            }
             if (!wait) { Reply(c, true, 0, msg); return; }
 
             lock (gate)
@@ -144,7 +206,7 @@ namespace MonoDbg
             {
                 if (state != State.Stopped) { Reply(c, false, 2, "[monodbg] not stopped (" + state + ")"); return; }
                 frames = null; state = State.Running;
-                try { vm.Resume(); } catch (Exception e) { Reply(c, false, 5, "resume failed: " + e.Message); return; }
+                if (!TryVm(() => vm.Resume(), out var err)) { Reply(c, false, 5, "[monodbg] resume failed: " + err); return; }
                 Reply(c, true, 0, "[monodbg] resumed.");
             }
         }
@@ -176,12 +238,12 @@ namespace MonoDbg
         }
 
         // ---- breakpoint arming ----
-        enum ArmResult { Armed, TypeMissing, MethodMissing, Ambiguous }
+        enum ArmResult { Armed, TypeMissing, MethodMissing, Ambiguous, AgentUnresponsive }
 
         static ArmResult Arm(string typeName, string methodName, string asm, out string msg)
         {
-            List<TypeMirror> matches;
-            try { matches = vm.GetTypes(typeName, false).ToList(); } catch { matches = new(); }
+            if (!TryVm(() => vm.GetTypes(typeName, false).ToList(), out List<TypeMirror> matches, out var err))
+            { msg = "[monodbg] " + err + " (resolving type '" + typeName + "')"; return ArmResult.AgentUnresponsive; }
             if (matches.Count == 0) { msg = "[monodbg] type '" + typeName + "' not loaded."; return ArmResult.TypeMissing; }
             if (asm != null) matches = matches.Where(t => AsmName(t) == asm).ToList();
             if (matches.Count == 0) { msg = "[monodbg] type '" + typeName + "' not in assembly '" + asm + "'."; return ArmResult.TypeMissing; }
@@ -191,15 +253,19 @@ namespace MonoDbg
                 return ArmResult.Ambiguous;
             }
             var type = matches[0];
-            var methods = type.GetMethods().Where(x => x.Name == methodName).ToList();
+            if (!TryVm(() => type.GetMethods().Where(x => x.Name == methodName).ToList(), out var methods, out err))
+            { msg = "[monodbg] " + err + " (resolving methods on " + type.FullName + ")"; return ArmResult.AgentUnresponsive; }
             if (methods.Count == 0)
             {
-                var near = type.GetMethods().Select(x => x.Name).Distinct()
-                    .Where(n => n.IndexOf(methodName, StringComparison.OrdinalIgnoreCase) >= 0).OrderBy(x => x);
+                if (!TryVm(() => type.GetMethods().Select(x => x.Name).Distinct()
+                        .Where(n => n.IndexOf(methodName, StringComparison.OrdinalIgnoreCase) >= 0).OrderBy(x => x).ToList(),
+                    out var near, out err))
+                { msg = "[monodbg] no method '" + methodName + "' on " + type.FullName + ", and " + err + " listing closest matches."; return ArmResult.AgentUnresponsive; }
                 msg = "[monodbg] no method '" + methodName + "' on " + type.FullName + ". closest: " + string.Join(", ", near);
                 return ArmResult.MethodMissing;
             }
-            foreach (var mm in methods) { vm.CreateBreakpointRequest(mm, 0).Enable(); armed.Add(type.FullName + "." + mm.Name); }
+            if (!TryVm(() => { foreach (var mm in methods) { vm.CreateBreakpointRequest(mm, 0).Enable(); armed.Add(type.FullName + "." + mm.Name); } }, out err))
+            { msg = "[monodbg] " + err + " (arming breakpoint)"; return ArmResult.AgentUnresponsive; }
             msg = "[monodbg] armed: " + type.FullName + "." + methodName + " (" + methods[0].GetParameters().Length + " params) in " + AsmName(type);
             return ArmResult.Armed;
         }
