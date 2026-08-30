@@ -1,0 +1,337 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Reflection;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using Mono.Debugger.Soft;
+
+namespace MonoDbg
+{
+    // The daemon: holds the single VM connection to the agent, keeps it suspended at a
+    // breakpoint, and serves discrete client commands (break/inspect/stack/continue/...)
+    // over a unix socket. One `gate` lock serializes all VM access + stop-state; the event
+    // loop pumps events and, on a breakpoint, stores the stopped frames and does NOT resume.
+    static class Session
+    {
+        static VirtualMachine vm;
+        static readonly object gate = new object();
+        enum State { Running, Stopped, Dead }
+        static State state = State.Running;
+        static StackFrame[] frames;
+        static string agentError;
+        static string sockPath;
+        static readonly List<string> armed = new();
+
+        public static int Run(string host, int port, string sock)
+        {
+            sockPath = sock;
+            if (File.Exists(sock)) { try { File.Delete(sock); } catch { } }
+            var server = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+            server.Bind(new UnixDomainSocketEndPoint(sock));
+            server.Listen(16);
+            AppDomain.CurrentDomain.ProcessExit += (_, __) => { try { File.Delete(sock); } catch { } };
+
+            try { vm = VirtualMachineManager.Connect(new IPEndPoint(IPAddress.Parse(host), port)); }
+            catch (Exception e) { agentError = e.Message; }
+
+            if (agentError == null)
+            {
+                vm.EnableEvents(EventType.VMDeath, EventType.VMDisconnect);
+                new Thread(EventLoop) { IsBackground = true }.Start();
+            }
+
+            while (true)
+            {
+                Socket c;
+                try { c = server.Accept(); } catch { break; }
+                new Thread(() => Handle(c)) { IsBackground = true }.Start();
+            }
+            return 0;
+        }
+
+        static void EventLoop()
+        {
+            while (true)
+            {
+                EventSet es;
+                try { es = vm.GetNextEventSet(); }
+                catch { lock (gate) { state = State.Dead; Monitor.PulseAll(gate); } return; }
+                lock (gate)
+                {
+                    foreach (var e in es.Events)
+                    {
+                        if (e is BreakpointEvent be)
+                        {
+                            try { frames = be.Thread.GetFrames(); } catch { frames = Array.Empty<StackFrame>(); }
+                            state = State.Stopped;
+                        }
+                        else if (e is VMDeathEvent || e is VMDisconnectEvent) state = State.Dead;
+                    }
+                    Monitor.PulseAll(gate);
+                    if (state == State.Running) { try { vm.Resume(); } catch { } }
+                }
+            }
+        }
+
+        static void Handle(Socket c)
+        {
+            using (c)
+            {
+                var raw = ReadLine(c);
+                if (raw == null) return;
+                Dictionary<string, string> m;
+                try { m = JsonSerializer.Deserialize<Dictionary<string, string>>(raw); }
+                catch { Reply(c, false, 1, "bad request"); return; }
+                string cmd = m.GetValueOrDefault("cmd", "");
+
+                if (agentError != null && cmd != "quit")
+                {
+                    Reply(c, false, 3, "[monodbg] agent connect failed: " + agentError);
+                    Shutdown(3);
+                    return;
+                }
+                switch (cmd)
+                {
+                    case "break": DoBreak(c, m); break;
+                    case "inspect": DoInspect(c, m); break;
+                    case "stack": lock (gate) Reply(c, state == State.Stopped, state == State.Stopped ? 0 : 2, state == State.Stopped ? FormatStack() : "[monodbg] not stopped (" + state + ")"); break;
+                    case "continue": DoContinue(c); break;
+                    case "status": DoStatus(c); break;
+                    case "quit": Reply(c, true, 0, "[monodbg] detaching."); try { vm?.Detach(); } catch { } Shutdown(0); break;
+                    default: Reply(c, false, 64, "unknown cmd '" + cmd + "'"); break;
+                }
+            }
+        }
+
+        static void DoBreak(Socket c, Dictionary<string, string> m)
+        {
+            string target = m.GetValueOrDefault("target", "");
+            string asm = m.GetValueOrDefault("asm", null);
+            bool wait = m.GetValueOrDefault("wait", "0") == "1";
+            int timeout = int.Parse(m.GetValueOrDefault("timeout", "120"));
+            int dot = target.LastIndexOf('.');
+            string tn = dot < 0 ? target : target.Substring(0, dot);
+            string mn = dot < 0 ? "" : target.Substring(dot + 1);
+
+            string msg; ArmResult r;
+            lock (gate) r = Arm(tn, mn, asm, out msg);
+            if (r != ArmResult.Armed) { Reply(c, false, r == ArmResult.MethodMissing ? 65 : 66, msg); return; }
+            if (!wait) { Reply(c, true, 0, msg); return; }
+
+            lock (gate)
+            {
+                long deadline = Environment.TickCount64 + timeout * 1000L;
+                while (state == State.Running)
+                {
+                    long rem = deadline - Environment.TickCount64;
+                    if (rem <= 0) break;
+                    Monitor.Wait(gate, (int)rem);
+                }
+                if (state == State.Stopped) Reply(c, true, 0, msg + "\n" + FormatStack());
+                else if (state == State.Dead) Reply(c, false, 4, msg + "\n[monodbg] VM dead");
+                else Reply(c, false, 2, msg + "\n[monodbg] timeout waiting for hit");
+            }
+        }
+
+        static void DoContinue(Socket c)
+        {
+            lock (gate)
+            {
+                if (state != State.Stopped) { Reply(c, false, 2, "[monodbg] not stopped (" + state + ")"); return; }
+                frames = null; state = State.Running;
+                try { vm.Resume(); } catch (Exception e) { Reply(c, false, 5, "resume failed: " + e.Message); return; }
+                Reply(c, true, 0, "[monodbg] resumed.");
+            }
+        }
+
+        static void DoStatus(Socket c)
+        {
+            lock (gate)
+            {
+                var sb = new StringBuilder();
+                sb.Append("[monodbg] state=").Append(state);
+                sb.Append(" armed=[").Append(string.Join(", ", armed)).Append(']');
+                if (state == State.Stopped && frames?.Length > 0)
+                    sb.Append(" at ").Append(FrameLabel(frames[0]));
+                Reply(c, true, 0, sb.ToString());
+            }
+        }
+
+        static void DoInspect(Socket c, Dictionary<string, string> m)
+        {
+            string expr = m.GetValueOrDefault("expr", "");
+            int frameIdx = int.Parse(m.GetValueOrDefault("frame", "0"));
+            lock (gate)
+            {
+                if (state != State.Stopped) { Reply(c, false, 2, "[monodbg] not stopped (" + state + ")"); return; }
+                if (frames == null || frameIdx < 0 || frameIdx >= frames.Length) { Reply(c, false, 1, "[monodbg] no frame " + frameIdx); return; }
+                try { Reply(c, true, 0, Eval(frames[frameIdx], expr)); }
+                catch (Exception e) { Reply(c, false, 1, "[monodbg] inspect error: " + e.Message); }
+            }
+        }
+
+        // ---- breakpoint arming ----
+        enum ArmResult { Armed, TypeMissing, MethodMissing, Ambiguous }
+
+        static ArmResult Arm(string typeName, string methodName, string asm, out string msg)
+        {
+            List<TypeMirror> matches;
+            try { matches = vm.GetTypes(typeName, false).ToList(); } catch { matches = new(); }
+            if (matches.Count == 0) { msg = "[monodbg] type '" + typeName + "' not loaded."; return ArmResult.TypeMissing; }
+            if (asm != null) matches = matches.Where(t => AsmName(t) == asm).ToList();
+            if (matches.Count == 0) { msg = "[monodbg] type '" + typeName + "' not in assembly '" + asm + "'."; return ArmResult.TypeMissing; }
+            if (matches.Count > 1)
+            {
+                msg = "[monodbg] type '" + typeName + "' ambiguous across: " + string.Join(", ", matches.Select(AsmName).Distinct()) + " -- pass --asm NAME.";
+                return ArmResult.Ambiguous;
+            }
+            var type = matches[0];
+            var methods = type.GetMethods().Where(x => x.Name == methodName).ToList();
+            if (methods.Count == 0)
+            {
+                var near = type.GetMethods().Select(x => x.Name).Distinct()
+                    .Where(n => n.IndexOf(methodName, StringComparison.OrdinalIgnoreCase) >= 0).OrderBy(x => x);
+                msg = "[monodbg] no method '" + methodName + "' on " + type.FullName + ". closest: " + string.Join(", ", near);
+                return ArmResult.MethodMissing;
+            }
+            foreach (var mm in methods) { vm.CreateBreakpointRequest(mm, 0).Enable(); armed.Add(type.FullName + "." + mm.Name); }
+            msg = "[monodbg] armed: " + type.FullName + "." + methodName + " (" + methods[0].GetParameters().Length + " params) in " + AsmName(type);
+            return ArmResult.Armed;
+        }
+
+        // ---- field-only expression eval ----
+        static string Eval(StackFrame f, string expr)
+        {
+            var segs = expr.Split('.');
+            Value cur = ResolveRoot(f, segs[0]);
+            for (int i = 1; i < segs.Length; i++) cur = FieldOf(cur, segs[i]);
+
+            var sb = new StringBuilder();
+            sb.Append(expr).Append(" = ").Append(Fmt(cur));
+            foreach (var (name, val) in Expand(cur)) sb.Append("\n  .").Append(name).Append(" = ").Append(Fmt(val));
+            return sb.ToString();
+        }
+
+        static Value ResolveRoot(StackFrame f, string name)
+        {
+            if (name == "this")
+            {
+                var t = f.GetThis();
+                if (t == null) throw new Exception("frame has no 'this' (static method?)");
+                return t;
+            }
+            var p = f.Method.GetParameters().FirstOrDefault(x => x.Name == name);
+            if (p != null) return f.GetValue(p);
+            var lv = f.GetVisibleVariableByName(name);
+            if (lv != null) return f.GetValue(lv);
+            throw new Exception("no root '" + name + "' (not this/arg/local; locals need PDB)");
+        }
+
+        static Value FieldOf(Value v, string name)
+        {
+            if (v is ObjectMirror om)
+            {
+                var fld = InstanceAndStaticFields(om.Type).FirstOrDefault(x => x.Name == name)
+                          ?? throw new Exception("no field '" + name + "' on " + om.Type.FullName);
+                return om.GetValue(fld);
+            }
+            if (v is StructMirror sm)
+            {
+                var flds = InstanceFields(sm.Type);
+                int idx = flds.FindIndex(x => x.Name == name);
+                if (idx < 0 || idx >= sm.Fields.Length) throw new Exception("no field '" + name + "' on struct " + sm.Type.FullName);
+                return sm.Fields[idx];
+            }
+            throw new Exception("cannot read field '" + name + "' on " + Fmt(v));
+        }
+
+        static IEnumerable<(string, Value)> Expand(Value v)
+        {
+            if (v is ObjectMirror om)
+                foreach (var f in InstanceFields(om.Type))
+                { Value val; try { val = om.GetValue(f); } catch { val = null; } yield return (f.Name, val); }
+            else if (v is StructMirror sm)
+            {
+                var flds = InstanceFields(sm.Type);
+                for (int i = 0; i < flds.Count && i < sm.Fields.Length; i++) yield return (flds[i].Name, sm.Fields[i]);
+            }
+        }
+
+        static List<FieldInfoMirror> InstanceFields(TypeMirror t)
+        {
+            var seen = new HashSet<string>(); var acc = new List<FieldInfoMirror>();
+            for (var cur = t; cur != null; cur = SafeBase(cur))
+                foreach (var f in cur.GetFields())
+                    if ((f.Attributes & FieldAttributes.Static) == 0 && seen.Add(f.Name)) acc.Add(f);
+            return acc;
+        }
+
+        static List<FieldInfoMirror> InstanceAndStaticFields(TypeMirror t)
+        {
+            var seen = new HashSet<string>(); var acc = new List<FieldInfoMirror>();
+            for (var cur = t; cur != null; cur = SafeBase(cur))
+                foreach (var f in cur.GetFields())
+                    if (seen.Add(f.Name)) acc.Add(f);
+            return acc;
+        }
+
+        static TypeMirror SafeBase(TypeMirror t) { try { return t.BaseType; } catch { return null; } }
+
+        // ---- formatting ----
+        static string FormatStack()
+        {
+            if (frames == null) return "[monodbg] no frames";
+            var sb = new StringBuilder();
+            for (int i = 0; i < frames.Length; i++) sb.Append(i == 0 ? "" : "\n").Append("  #").Append(i.ToString().PadRight(2)).Append(' ').Append(FrameLabel(frames[i]));
+            return sb.ToString();
+        }
+
+        static string FrameLabel(StackFrame f)
+        {
+            var m = f.Method;
+            string owner = m?.DeclaringType != null ? m.DeclaringType.FullName : "?";
+            string sig = m == null ? "?" : m.Name + "(" + string.Join(", ", m.GetParameters().Select(p => p.ParameterType != null ? p.ParameterType.Name : "?")) + ")";
+            string a = m?.DeclaringType != null ? AsmName(m.DeclaringType) : "?";
+            return owner + "." + sig + "  [IL_" + f.ILOffset.ToString("x4") + "]  <" + a + ">";
+        }
+
+        static string Fmt(Value v)
+        {
+            try
+            {
+                if (v == null) return "null";
+                if (v is PrimitiveValue pv) return pv.Value == null ? "null" : pv.Value.ToString();
+                if (v is StringMirror sm) return "\"" + sm.Value + "\"";
+                if (v is EnumMirror em) return "enum " + em.Type.Name;
+                if (v is StructMirror st) return "struct " + st.Type.Name;
+                if (v is ObjectMirror om) return om.Type.FullName + "#" + om.Address;
+                return v.ToString();
+            }
+            catch (Exception e) { return "<err: " + e.Message + ">"; }
+        }
+
+        static string AsmName(TypeMirror t) { try { return t.Assembly.GetName().Name; } catch { return "?"; } }
+
+        // ---- ipc ----
+        static void Reply(Socket c, bool ok, int code, string text)
+        {
+            var o = new Dictionary<string, object> { ["ok"] = ok, ["code"] = code, ["text"] = text };
+            try { c.Send(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(o) + "\n")); } catch { }
+        }
+
+        static string ReadLine(Socket c)
+        {
+            var sb = new StringBuilder(); var buf = new byte[1];
+            try { while (true) { int n = c.Receive(buf); if (n <= 0) break; if (buf[0] == '\n') break; sb.Append((char)buf[0]); } }
+            catch (SocketException) { return sb.Length > 0 ? sb.ToString() : null; }
+            return sb.Length > 0 ? sb.ToString() : null;
+        }
+
+        static void Shutdown(int code) { try { File.Delete(sockPath); } catch { } Environment.Exit(code); }
+    }
+}
