@@ -52,7 +52,11 @@ namespace MonoDbg
         static StackFrame[] frames;
         static string agentError;
         static string sockPath;
-        static readonly List<string> armed = new();
+        // Armed method-entry breakpoints: label "NS.Type.Method(Sig)" plus the request handle,
+        // so `bp` can list them with stable indices and `unbreak` can clear individual ones
+        // agent-side (EventRequest.Disable() == ClearEventRequest on the agent).
+        sealed class ArmedBp { public EventRequest Req; public string Label; }
+        static readonly List<ArmedBp> armed = new();
         static PosixSignalRegistration sigterm, sigint;
 
         public static int Run(string host, int port, string sock)
@@ -155,6 +159,8 @@ namespace MonoDbg
                 switch (cmd)
                 {
                     case "break": DoBreak(c, m); break;
+                    case "breakpoints": DoBreakpoints(c); break;
+                    case "unbreak": DoUnbreak(c, m); break;
                     case "inspect": DoInspect(c, m); break;
                     case "stack": lock (gate) Reply(c, state == State.Stopped, state == State.Stopped ? 0 : 2, state == State.Stopped ? FormatStack() : "[monodbg] not stopped (" + state + ")"); break;
                     case "continue": DoContinue(c); break;
@@ -200,6 +206,58 @@ namespace MonoDbg
             }
         }
 
+        static void DoBreakpoints(Socket c)
+        {
+            lock (gate)
+            {
+                if (armed.Count == 0) { Reply(c, true, 0, "[monodbg] no breakpoints armed"); return; }
+                var sb = new StringBuilder();
+                sb.Append("[monodbg] ").Append(armed.Count).Append(" armed:");
+                for (int i = 0; i < armed.Count; i++)
+                    sb.Append("\n  ").Append(i).Append(": ").Append(armed[i].Label);
+                sb.Append("\n[monodbg] remove with: unbreak <#> | unbreak Type.Method | unbreak --all");
+                Reply(c, true, 0, sb.ToString());
+            }
+        }
+
+        static void DoUnbreak(Socket c, Dictionary<string, string> m)
+        {
+            string target = m.GetValueOrDefault("target", "");
+            bool all = m.GetValueOrDefault("all", "0") == "1";
+            lock (gate)
+            {
+                if (armed.Count == 0) { Reply(c, false, 1, "[monodbg] no breakpoints armed"); return; }
+                List<ArmedBp> picks;
+                if (all) picks = armed.ToList();
+                else if (target.Length == 0) { Reply(c, false, 64, "[monodbg] usage: unbreak <#|Type.Method> | --all"); return; }
+                else if (int.TryParse(target, out int idx))
+                {
+                    if (idx < 0 || idx >= armed.Count) { Reply(c, false, 1, "[monodbg] no breakpoint #" + idx + " (see 'monodbg bp')"); return; }
+                    picks = new List<ArmedBp> { armed[idx] };
+                }
+                else
+                {
+                    // 'NS.Type.Method' prefix matches ignoring the label's parameter signature
+                    // (removes all overloads at once); otherwise fall back to substring
+                    picks = armed.Where(b => b.Label == target || b.Label.StartsWith(target + "(")).ToList();
+                    if (picks.Count == 0) picks = armed.Where(b => b.Label.Contains(target)).ToList();
+                    if (picks.Count == 0) { Reply(c, false, 1, "[monodbg] no armed breakpoint matches '" + target + "' (see 'monodbg bp')"); return; }
+                }
+                var removed = new List<string>(); var failed = new List<string>();
+                foreach (var p in picks)
+                {
+                    // conservative on failure: a request whose Clear round-trip failed stays
+                    // listed (retry or 'quit' cleans up) rather than lingering armed but unlisted
+                    if (TryVm(() => p.Req.Disable(), out var err)) { armed.Remove(p); removed.Add(p.Label); }
+                    else failed.Add(p.Label + " (" + err + ")");
+                }
+                string text = "[monodbg] removed: " + string.Join(", ", removed);
+                if (failed.Count > 0) text += "\n[monodbg] failed: " + string.Join("; ", failed);
+                if (removed.Count == 0) { Reply(c, false, 5, text); return; }
+                Reply(c, true, failed.Count == 0 ? 0 : 5, text);
+            }
+        }
+
         static void DoContinue(Socket c)
         {
             lock (gate)
@@ -217,7 +275,8 @@ namespace MonoDbg
             {
                 var sb = new StringBuilder();
                 sb.Append("[monodbg] state=").Append(state);
-                sb.Append(" armed=[").Append(string.Join(", ", armed)).Append(']');
+                sb.Append(" armed=").Append(armed.Count);
+                if (armed.Count > 0) sb.Append(" (list: monodbg bp)");
                 if (state == State.Stopped && frames?.Length > 0)
                     sb.Append(" at ").Append(FrameLabel(frames[0]));
                 Reply(c, true, 0, sb.ToString());
@@ -308,9 +367,23 @@ namespace MonoDbg
                 msg = "[monodbg] no method '" + methodName + "' on " + type.FullName + ". closest: " + string.Join(", ", near);
                 return ArmResult.MethodMissing;
             }
-            if (!TryVm(() => { foreach (var mm in methods) { vm.CreateBreakpointRequest(mm, 0).Enable(); armed.Add(type.FullName + "." + mm.Name); } }, out err))
+            var newly = new List<string>(); int skipped = 0;
+            if (!TryVm(() =>
+            {
+                foreach (var mm in methods)
+                {
+                    string label = type.FullName + "." + mm.Name + "(" + string.Join(", ", mm.GetParameters().Select(p => p.ParameterType != null ? p.ParameterType.Name : "?")) + ")";
+                    if (armed.Any(b => b.Label == label)) { skipped++; continue; } // re-arm: no-op, not a second request
+                    var req = vm.CreateBreakpointRequest(mm, 0);
+                    req.Enable();
+                    armed.Add(new ArmedBp { Req = req, Label = label });
+                    newly.Add(label);
+                }
+            }, out err))
             { msg = "[monodbg] " + err + " (arming breakpoint)"; return ArmResult.AgentUnresponsive; }
-            msg = "[monodbg] armed: " + type.FullName + "." + methodName + " (" + methods[0].GetParameters().Length + " params) in " + AsmName(type);
+            msg = newly.Count > 0
+                ? "[monodbg] armed: " + string.Join(", ", newly) + " in " + AsmName(type) + (skipped > 0 ? " (" + skipped + " already armed)" : "")
+                : "[monodbg] " + type.FullName + "." + methodName + ": already armed";
             return ArmResult.Armed;
         }
 

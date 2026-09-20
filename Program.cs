@@ -14,6 +14,7 @@ using System.Threading;
 //   monodbg break <Type.Method> [--asm N] [--wait] [--timeout S]
 //   monodbg inspect [<expr>] [--frame N]  no expr: list inspectable roots (this/args/locals)
 //                                           expr = this | argName | this.field.subfield (fields only)
+//   monodbg bp | unbreak <#|Type.Method> | unbreak --all
 //   monodbg stack | continue | status | quit
 namespace MonoDbg
 {
@@ -38,6 +39,8 @@ namespace MonoDbg
             {
                 case "__daemon": return Session.Run(host, port, Sock);
                 case "break": return CmdBreak(a);
+                case "bp": case "breaks": case "breakpoints": return Send(new() { ["cmd"] = "breakpoints" });
+                case "unbreak": case "rmbreak": return CmdUnbreak(a);
                 case "inspect": return CmdInspect(a);
                 case "stack": return Send(new() { ["cmd"] = "stack" });
                 case "continue": case "cont": return Send(new() { ["cmd"] = "continue" });
@@ -65,6 +68,16 @@ namespace MonoDbg
             var req = new Dictionary<string, string> { ["cmd"] = "break", ["target"] = target, ["wait"] = wait ? "1" : "0", ["timeout"] = timeout.ToString() };
             if (asm != null) req["asm"] = asm;
             return Send(req, wait ? timeout + 15 : 15);
+        }
+
+        static int CmdUnbreak(List<string> a)
+        {
+            bool all = false; string target = null;
+            for (int i = 0; i < a.Count; i++) { if (a[i] == "--all") all = true; else target = a[i]; }
+            if (!all && target == null) { Console.Error.WriteLine("usage: monodbg unbreak <#|Type.Method> | --all"); return 64; }
+            var req = new Dictionary<string, string> { ["cmd"] = "unbreak" };
+            if (all) req["all"] = "1"; else req["target"] = target;
+            return Send(req);
         }
 
         static int CmdInspect(List<string> a)
@@ -136,6 +149,7 @@ namespace MonoDbg
                 "usage: monodbg <cmd> [--host H] [--port N]\n" +
                 "  break <Type.Method> [--asm N] [--wait] [--timeout S]   arm; --wait blocks until hit\n" +
                 "  inspect [<expr>] [--frame N]                            no expr: list roots; expr: this | arg | this.field.sub\n" +
+                "  bp | unbreak <#|Type.Method> | unbreak --all             list | remove armed breakpoints\n" +
                 "  stack | continue | status | quit");
         }
     }

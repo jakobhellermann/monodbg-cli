@@ -44,6 +44,8 @@ $D break HeroController.Downspike --asm Silksong.Assembly-CSharp
 
 $D status                        # state=Stopped at HeroController.Downspike()
 $D stack                         # #0 Downspike  <-  #1 FixedUpdate
+$D bp                            # list armed breakpoints (with indices)
+$D unbreak 0                     # remove by index; also: unbreak Type.Method | unbreak --all
 $D inspect this                  # all instance fields, one level flat
 $D inspect this.cState           # -> downSpiking=True, falling=True, onGround=False, ...
 $D inspect this.cState.onGround  # nested field path
@@ -58,11 +60,13 @@ immediately — handy from a terminal, less so when you can't see the prompt dur
 
 | command | what it does |
 | --- | --- |
-| `break <Type.Method> [--asm N] [--wait] [--timeout S]` | arm a method-entry breakpoint; auto-spawns the daemon |
-| `inspect <expr> [--frame N]` | read `this` / arg / `this.field.sub` (fields only) at the stop |
+| `break <Type.Method> [--asm N] [--wait] [--timeout S]` | arm a method-entry breakpoint; auto-spawns the daemon; re-arming is a no-op |
+| `bp` | list armed breakpoints with indices |
+| `unbreak <#\|Type.Method\|--all>` | remove breakpoint(s) by index, by name (all overloads), or all |
+| `inspect [<expr>] [--frame N]` | list the frame's roots (no expr) or read `this` / arg / `this.field.sub` (fields only) |
 | `stack` | current call stack |
 | `continue` | resume the VM (breakpoint stays armed) |
-| `status` | daemon state, armed breakpoints, current location |
+| `status` | daemon state, armed breakpoint count, current location |
 | `quit` | detach + stop the daemon (unfreezes the game) |
 
 Global: `--host H` (default `127.0.0.1`), `--port N` (default `10001`).
