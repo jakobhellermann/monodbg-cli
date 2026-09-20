@@ -253,8 +253,10 @@ namespace MonoDbg
             var sb = new StringBuilder();
             sb.Append("[monodbg] frame #").Append(idx).Append(": ").Append(FrameLabel(f));
 
+            // static frames: the agent returns a null-valued Value for `this` (not a null reference),
+            // so detect it via the formatted result
             string thisLine;
-            try { var t = f.GetThis(); thisLine = t != null ? Fmt(t) : "(static method -- no this)"; }
+            try { var t = f.GetThis(); string fmt = t != null ? Fmt(t) : null; thisLine = fmt == null || fmt == "null" ? "(static method -- no this)" : fmt; }
             catch { thisLine = "<unavailable>"; }
             sb.Append("\n  this   : ").Append(thisLine);
 
