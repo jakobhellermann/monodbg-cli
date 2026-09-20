@@ -1,5 +1,20 @@
 # monodbg
 
+Simple CLI mono debugger.
+
+```
+usage: monodbg <cmd> [--host H] [--port N]
+  break <Type.Method> [--asm N] [--wait] [--timeout S]   arm; --wait blocks until hit
+  inspect [<expr>] [--frame N]                            no expr: list roots; expr: this | arg | this.field.sub
+  bp | unbreak <#|Type.Method> | unbreak --all             list | remove armed breakpoints
+  stack | continue | status | quit
+```
+
+Current state: completely vibecoded, for personal use. Might rewrite this later.
+
+
+# Slop Readme
+
 Minimal CLI client for a **Mono soft-debugger** agent (the same wire protocol Rider/MonoDevelop
 use). Built to set breakpoints and inspect state in a running Unity game without a GUI debugger.
 
