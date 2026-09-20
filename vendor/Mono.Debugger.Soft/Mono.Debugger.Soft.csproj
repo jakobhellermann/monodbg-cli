@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Vendored from https://github.com/mono/debugger-libs (MIT), pinned at
+    e7fbb713d156d11193ed404783ad6fe9c4042a6d. Sources live in src/ (including
+    Locale.cs, which upstream keeps at the project root).
+    The upstream csproj was rewritten here: single net8.0 TFM (was net6.0;net472),
+    no strong-name signing, GenerateAssemblyInfo=false, NoWarn for the legacy
+    SYSLIB0050/SYSLIB0001/CS0618 warnings, Mono.Cecil 0.11.5.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Mono.Debugger.Soft</AssemblyName>
+    <RootNamespace>Mono.Debugger.Soft</RootNamespace>
+    <DefineConstants>MONO_DATACONVERTER_STATIC_METHODS;ENABLE_CECIL</DefineConstants>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <NoWarn>SYSLIB0001;SYSLIB0050;CS0219;CS0618</NoWarn>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Mono.Cecil" Version="0.11.5" />
+    <PackageReference Include="Microsoft.SymbolStore" Version="1.0.411401" />
+    <PackageReference Include="Microsoft.FileFormats" Version="1.0.411401" />
+  </ItemGroup>
+</Project>
