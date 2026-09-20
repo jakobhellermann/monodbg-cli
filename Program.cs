@@ -92,13 +92,17 @@ namespace MonoDbg
         static bool EnsureDaemon()
         {
             if (TryConnect(out var s)) { s.Dispose(); return true; }
+            // In a single-file bundle Assembly.Location is "" (IL3000): there is no separate dll
+            // to hand to a host - the exe hosts itself. Handle that as the apphost case below.
+#pragma warning disable IL3000 // Assembly.Location returns empty for single-file apps; handled
             var dll = Assembly.GetEntryAssembly().Location;
+#pragma warning restore IL3000
             var host_ = Environment.ProcessPath ?? "dotnet";
             var log = $"/tmp/monodbg-{host}-{port}.log";
             // ProcessPath is a self-contained apphost (e.g. under `dotnet run`, or running the built
             // exe directly) when its name matches the entry dll's: it already hosts the dll, so don't
             // pass the dll path as an extra arg (that would shift argv and swallow "__daemon").
-            bool isApphost = Path.GetFileNameWithoutExtension(host_) == Path.GetFileNameWithoutExtension(dll);
+            bool isApphost = dll.Length == 0 || Path.GetFileNameWithoutExtension(host_) == Path.GetFileNameWithoutExtension(dll);
             var target = isApphost ? $"\"{host_}\"" : $"\"{host_}\" \"{dll}\"";
             // setsid + redirected fds: the daemon must not inherit our stdio, or it holds the
             // caller's pipe open and blocks the shell until the daemon exits.
