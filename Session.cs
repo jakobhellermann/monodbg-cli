@@ -232,10 +232,52 @@ namespace MonoDbg
             {
                 if (state != State.Stopped) { Reply(c, false, 2, "[monodbg] not stopped (" + state + ")"); return; }
                 if (frames == null || frameIdx < 0 || frameIdx >= frames.Length) { Reply(c, false, 1, "[monodbg] no frame " + frameIdx); return; }
+                if (string.IsNullOrEmpty(expr))
+                {
+                    if (!TryVm(() => ListRoots(frames[frameIdx], frameIdx), out var listing, out var err))
+                    { Reply(c, false, 1, "[monodbg] " + err + " (listing frame)"); return; }
+                    Reply(c, true, 0, listing);
+                    return;
+                }
                 try { Reply(c, true, 0, Eval(frames[frameIdx], expr)); }
                 catch (Exception e) { Reply(c, false, 1, "[monodbg] inspect error: " + e.Message); }
             }
         }
+
+        // `inspect` with no expression: list the roots Eval() accepts in this frame -- `this`, the
+        // method's arguments, and locals in scope. Args come from the method mirror (always
+        // available); locals need the assembly's PDBs, so degrade to a note when absent. Each
+        // piece is guarded individually: a wedged/partial piece must not hide the rest.
+        static string ListRoots(StackFrame f, int idx)
+        {
+            var sb = new StringBuilder();
+            sb.Append("[monodbg] frame #").Append(idx).Append(": ").Append(FrameLabel(f));
+
+            string thisLine;
+            try { var t = f.GetThis(); thisLine = t != null ? Fmt(t) : "(static method -- no this)"; }
+            catch { thisLine = "<unavailable>"; }
+            sb.Append("\n  this   : ").Append(thisLine);
+
+            sb.Append("\n  args   : ");
+            try
+            {
+                var ps = f.Method?.GetParameters() ?? Array.Empty<ParameterInfoMirror>();
+                sb.Append(ps.Length == 0 ? "(none)" : string.Join(", ", ps.Select(p => p.Name + " (" + SafeTypeName(p.ParameterType) + ")")));
+            }
+            catch { sb.Append("<unavailable>"); }
+
+            sb.Append("\n  locals : ");
+            try
+            {
+                var ls = f.GetVisibleVariables().Where(l => !l.IsArg).ToList();
+                sb.Append(ls.Count == 0 ? "(none in scope)" : string.Join(", ", ls.Select(l => l.Name + " (" + SafeTypeName(l.Type) + ")")));
+            }
+            catch { sb.Append("(unavailable -- no PDBs/debug info; only this/args)"); }
+
+            return sb.ToString();
+        }
+
+        static string SafeTypeName(TypeMirror t) { try { return t?.Name ?? "?"; } catch { return "?"; } }
 
         // ---- breakpoint arming ----
         enum ArmResult { Armed, TypeMissing, MethodMissing, Ambiguous, AgentUnresponsive }

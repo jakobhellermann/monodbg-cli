@@ -12,7 +12,8 @@ using System.Threading;
 // talk to a background daemon (Session) over a per-target unix socket; the daemon holds the one
 // VM connection to the agent and keeps it suspended at a breakpoint between commands.
 //   monodbg break <Type.Method> [--asm N] [--wait] [--timeout S]
-//   monodbg inspect <expr> [--frame N]      expr = this | argName | this.field.subfield (fields only)
+//   monodbg inspect [<expr>] [--frame N]  no expr: list inspectable roots (this/args/locals)
+//                                           expr = this | argName | this.field.subfield (fields only)
 //   monodbg stack | continue | status | quit
 namespace MonoDbg
 {
@@ -70,7 +71,8 @@ namespace MonoDbg
         {
             string expr = null; int frame = 0;
             for (int i = 0; i < a.Count; i++) { if (a[i] == "--frame") frame = int.Parse(a[++i]); else expr = a[i]; }
-            if (expr == null) { Console.Error.WriteLine("usage: monodbg inspect <expr> [--frame N]"); return 64; }
+            // no expr: ask the daemon for the frame's inspectable roots instead of bailing with usage
+            if (expr == null) return Send(new() { ["cmd"] = "inspect", ["frame"] = frame.ToString() });
             return Send(new() { ["cmd"] = "inspect", ["expr"] = expr, ["frame"] = frame.ToString() });
         }
 
@@ -133,7 +135,7 @@ namespace MonoDbg
             Console.Error.WriteLine(
                 "usage: monodbg <cmd> [--host H] [--port N]\n" +
                 "  break <Type.Method> [--asm N] [--wait] [--timeout S]   arm; --wait blocks until hit\n" +
-                "  inspect <expr> [--frame N]                             expr: this | arg | this.field.sub\n" +
+                "  inspect [<expr>] [--frame N]                            no expr: list roots; expr: this | arg | this.field.sub\n" +
                 "  stack | continue | status | quit");
         }
     }
